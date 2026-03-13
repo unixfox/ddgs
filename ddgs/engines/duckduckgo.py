@@ -1,4 +1,8 @@
-"""Duckduckgo search engine implementation."""
+"""DuckDuckGo search engine implementation.
+
+Uses the DDG-HTML (no-JS) endpoint at https://html.duckduckgo.com/html/.
+Based on SearXNG's duckduckgo.py engine implementation.
+"""
 
 from collections.abc import Mapping
 from typing import Any, ClassVar
@@ -8,7 +12,7 @@ from ddgs.results import TextResult
 
 
 class Duckduckgo(BaseSearchEngine[TextResult]):
-    """Duckduckgo search engine."""
+    """DuckDuckGo search engine."""
 
     name = "duckduckgo"
     category = "text"
@@ -17,8 +21,19 @@ class Duckduckgo(BaseSearchEngine[TextResult]):
     search_url = "https://html.duckduckgo.com/html/"
     search_method = "POST"
 
-    items_xpath = "//div[contains(@class, 'body')]"
-    elements_xpath: ClassVar[Mapping[str, str]] = {"title": ".//h2//text()", "href": "./a/@href", "body": "./a//text()"}
+    # Scoped to #links container and web-result class to exclude ad results.
+    # Based on SearXNG's duckduckgo.py XPaths.
+    items_xpath = '//div[@id="links"]/div[contains(@class, "web-result")]'
+    elements_xpath: ClassVar[Mapping[str, str]] = {
+        "title": ".//h2/a//text()",
+        "href": ".//h2/a/@href",
+        "body": './/a[contains(@class, "result__snippet")]//text()',
+    }
+
+    headers_update: ClassVar[dict[str, str]] = {
+        "Referer": "https://html.duckduckgo.com/",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
 
     def build_payload(
         self,
@@ -30,13 +45,38 @@ class Duckduckgo(BaseSearchEngine[TextResult]):
         **kwargs: str,  # noqa: ARG002
     ) -> dict[str, Any]:
         """Build a payload for the search request."""
-        payload = {"q": query, "b": "", "l": region}
+        payload: dict[str, str] = {"q": query, "b": "", "kl": region}
         if page > 1:
             payload["s"] = f"{10 + (page - 2) * 15}"
         if timelimit:
             payload["df"] = timelimit
         return payload
 
-    def post_extract_results(self, results: list[TextResult]) -> list[TextResult]:
-        """Post-process search results."""
-        return [r for r in results if not r.href.startswith("https://duckduckgo.com/y.js?")]
+    def search(
+        self,
+        query: str,
+        region: str = "us-en",
+        safesearch: str = "moderate",
+        timelimit: str | None = None,
+        page: int = 1,
+        **kwargs: str,
+    ) -> list[TextResult] | None:
+        """Search DuckDuckGo with proper cookies."""
+        payload = self.build_payload(
+            query=query, region=region, safesearch=safesearch, timelimit=timelimit, page=page, **kwargs
+        )
+        cookies: dict[str, str] = {}
+        if region:
+            cookies["kl"] = region
+        if timelimit:
+            cookies["df"] = timelimit
+        html_text = self.request(
+            self.search_method,
+            self.search_url,
+            data=payload,
+            cookies=cookies,
+        )
+        if not html_text:
+            return None
+        results = self.extract_results(html_text)
+        return self.post_extract_results(results)

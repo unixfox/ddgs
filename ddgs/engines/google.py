@@ -1,45 +1,44 @@
-"""Google search engine implementation."""
+"""Google search engine implementation.
+
+Uses iPhone GSA (Google Search App) user agents to get server-rendered HTML
+results from Google, following the approach used by SearXNG.
+"""
 
 from collections.abc import Mapping
 from random import SystemRandom
 from typing import Any, ClassVar
+from urllib.parse import unquote
 
 from ddgs.base import BaseSearchEngine
 from ddgs.results import TextResult
 
 random = SystemRandom()
 
+# iPhone GSA (Google Search App) user agents.
+# Google serves server-rendered HTML to these user agents.
+# Source: https://github.com/searxng/searxng/blob/master/searx/data/gsa_useragents.txt
+_GSA_TEMPLATE = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS {ios} like Mac OS X)"
+    " AppleWebKit/605.1.15 (KHTML, like Gecko)"
+    " GSA/{gsa} Mobile/15E148 Safari/604.1"
+)
+_GSA_VARIANTS = [
+    ("17_7_1", "406.0.862495628"),
+    ("18_0_1", "406.0.862495628"),
+    ("18_1_1", "399.2.845414227"),
+    ("18_5_0", "406.0.862495628"),
+    ("18_6_0", "406.0.862495628"),
+    ("18_6_2", "406.0.862495628"),
+    ("18_7_2", "404.0.856692123"),
+    ("18_7_3", "406.0.862495628"),
+    ("18_7_4", "406.0.862495628"),
+]
 
-def get_ua() -> str:
-    """Return one random User-Agent string."""
-    patterns = [
-        "Opera/9.80 (J2ME/MIDP; Opera Mini/{v}/{b}; U; {l}) Presto/{p} Version/{f}",
-        "Opera/9.80 (Android; Linux; Opera Mobi/{b}; U; {l}) Presto/{p} Version/{f}",
-        "Opera/9.80 (iPhone; Opera Mini/{v}/{b}; U; {l}) Presto/{p} Version/{f}",
-        "Opera/9.80 (iPad; Opera Mini/{v}/{b}; U; {l}) Presto/{p} Version/{f}",
-    ]
-    mini_versions = ["4.0", "5.0.17381", "7.1.32444", "9.80"]
-    mobi_builds = ["27", "447", "ADR-1011151731"]
-    builds = ["18.678", "24.743", "503"]
-    prestos = ["2.6.35", "2.7.60", "2.8.119"]
-    finals = ["10.00", "11.10", "12.16"]
-    langs = ["en-US", "en-GB", "de-DE", "fr-FR", "es-ES", "ru-RU", "zh-CN"]
-    fallback = "Opera/9.80 (iPad; Opera Mini/5.0.17381/503; U; eu) Presto/2.6.35 Version/11.10"
 
-    try:
-        p = random.choice(patterns)
-        vals = {
-            "l": random.choice(langs),
-            "p": random.choice(prestos),
-            "f": random.choice(finals),
-        }
-        if "{v}" in p:
-            vals["v"] = random.choice(mini_versions)
-        if "{b}" in p:
-            vals["b"] = random.choice(mobi_builds) if "Opera Mobi" in p else random.choice(builds)
-        return p.format(**vals)
-    except Exception:  # noqa: BLE001
-        return fallback
+def _get_gsa_ua() -> str:
+    """Return a random GSA (Google Search App) iPhone user agent."""
+    ios, gsa = random.choice(_GSA_VARIANTS)
+    return _GSA_TEMPLATE.format(ios=ios, gsa=gsa)
 
 
 class Google(BaseSearchEngine[TextResult]):
@@ -51,13 +50,15 @@ class Google(BaseSearchEngine[TextResult]):
 
     search_url = "https://www.google.com/search"
     search_method = "GET"
-    headers_update: ClassVar[dict[str, str]] = {"User-Agent": get_ua()}
+    headers_update: ClassVar[dict[str, str]] = {"User-Agent": _get_gsa_ua(), "Accept": "*/*"}
 
-    items_xpath = "//div[div[@data-hveid]//div[h3]]"
+    # XPaths matching Google's response format for GSA user agents.
+    # Based on SearXNG's google.py engine.
+    items_xpath = '//div[contains(@class, "MjjYud")]'
     elements_xpath: ClassVar[Mapping[str, str]] = {
-        "title": ".//h3//text()",
+        "title": './/div[contains(@role, "link")]//text()',
         "href": ".//a/@href",
-        "body": "./div/div/div[2]//text()",
+        "body": './/div[contains(@data-sncf, "1")]//text()',
     }
 
     def build_payload(
@@ -72,24 +73,51 @@ class Google(BaseSearchEngine[TextResult]):
         """Build a payload for the Google search request."""
         safesearch_base = {"on": "2", "moderate": "1", "off": "0"}
         start = (page - 1) * 10
-        payload = {
+        payload: dict[str, str] = {
             "q": query,
             "filter": safesearch_base[safesearch.lower()],
             "start": str(start),
+            "ie": "utf8",
+            "oe": "utf8",
         }
         country, lang = region.split("-")
-        payload["hl"] = f"{lang}-{country.upper()}"  # interface language
-        payload["lr"] = f"lang_{lang}"  # restricts to results written in a particular language
-        payload["cr"] = f"country{country.upper()}"  # restricts to results written in a particular country
+        payload["hl"] = f"{lang}-{country.upper()}"
+        payload["lr"] = f"lang_{lang}"
+        payload["cr"] = f"country{country.upper()}"
         if timelimit:
             payload["tbs"] = f"qdr:{timelimit}"
         return payload
 
+    def search(
+        self,
+        query: str,
+        region: str = "us-en",
+        safesearch: str = "moderate",
+        timelimit: str | None = None,
+        page: int = 1,
+        **kwargs: str,
+    ) -> list[TextResult] | None:
+        """Search Google with CONSENT cookie."""
+        payload = self.build_payload(
+            query=query, region=region, safesearch=safesearch, timelimit=timelimit, page=page, **kwargs
+        )
+        html_text = self.request(
+            self.search_method,
+            self.search_url,
+            params=payload,
+            cookies={"CONSENT": "YES+"},
+        )
+        if not html_text:
+            return None
+        results = self.extract_results(html_text)
+        return self.post_extract_results(results)
+
     def post_extract_results(self, results: list[TextResult]) -> list[TextResult]:
-        """Post-process search results."""
+        """Post-process search results: unwrap Google redirect URLs."""
         post_results = []
         for result in results:
             if result.href.startswith("/url?q="):
-                result.href = result.href.split("?q=")[1].split("&")[0]
-            post_results.append(result)
+                result.href = unquote(result.href[7:].split("&sa=U")[0])
+            if result.title and result.href.startswith("http"):
+                post_results.append(result)
         return post_results
