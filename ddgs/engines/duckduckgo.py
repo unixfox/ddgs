@@ -45,7 +45,7 @@ class Duckduckgo(BaseSearchEngine[TextResult]):
         **kwargs: str,  # noqa: ARG002
     ) -> dict[str, Any]:
         """Build a payload for the search request."""
-        payload: dict[str, str] = {"q": query, "b": "", "kl": region}
+        payload: dict[str, str] = {"q": query, "b": "", "kl": region}  # kl = region/locale
         if page > 1:
             # DDG returns 10 results on page 1, then 15 per page after that.
             payload["s"] = f"{10 + (page - 2) * 15}"
